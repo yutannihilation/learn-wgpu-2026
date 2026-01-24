@@ -791,6 +791,7 @@ name = "learn-wgpu-2026"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "env_logger",
  "glam",
  "pollster",
