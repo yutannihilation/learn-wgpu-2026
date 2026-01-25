@@ -21,7 +21,7 @@ use crate::{
 };
 use crate::{
     instance::InstanceRaw,
-    vertex::{INDICES, VERTICES, Vertex},
+    vertex::{INDICES, VERTICES},
 };
 
 const NUM_INSTANCES_PER_ROW: u32 = 10;
@@ -44,14 +44,27 @@ pub struct State {
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     depth_texture: crate::texture::Texture,
+    // Mesh pipelines use the same handle type as render pipelines, but are created
+    // with create_mesh_pipeline and executed via draw_mesh_tasks.
     render_pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    num_indices: u32,
+    // Mesh shaders read geometry and per-instance data from storage buffers.
+    mesh_bind_group: wgpu::BindGroup,
+    vertex_storage_buffer: wgpu::Buffer,
+    index_storage_buffer: wgpu::Buffer,
     diffuse_bind_group: wgpu::BindGroup,
     diffuse_texture: texture::Texture,
     instances: Vec<Instance>,
-    instance_buffer: wgpu::Buffer,
+    instance_storage_buffer: wgpu::Buffer,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct VertexStorage {
+    // Storage buffers align vec3 to 16 bytes in WGSL, so use vec4 and padding
+    // to keep the Rust/WGSL layouts compatible.
+    position: [f32; 4],
+    tex_coords: [f32; 2],
+    _pad: [f32; 2],
 }
 
 impl State {
@@ -59,7 +72,7 @@ impl State {
         let size = window.surface_size();
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
+            backends: wgpu::Backends::VULKAN,
             ..Default::default()
         });
 
@@ -67,18 +80,29 @@ impl State {
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::default(),
+                power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
             })
             .await?;
 
+        // debug
+        let info = adapter.get_info();
+        println!(
+            "adapter: {:?} {:?} {:?}",
+            info.name, info.backend, info.device_type
+        );
+        println!("features: {:?}", adapter.features());
+
+        // Mesh shaders are experimental in wgpu, so request the feature and
+        // mesh-shader-specific limits up front.
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: None,
-                required_features: wgpu::Features::empty(),
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                required_limits: wgpu::Limits::defaults(),
+                required_features: wgpu::Features::EXPERIMENTAL_MESH_SHADER,
+                experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+                required_limits: wgpu::Limits::defaults()
+                    .using_recommended_minimum_mesh_shader_values(),
                 memory_hints: Default::default(),
                 trace: wgpu::Trace::Off,
             })
@@ -128,6 +152,7 @@ impl State {
         let diffuse_texture =
             texture::Texture::from_bytes(&device, &queue, diffuse_bytes, "happy-tree.png").unwrap();
 
+        // Texture/sampler group for the fragment shader (same as traditional pipeline).
         let texture_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Bind Group Layout"),
@@ -186,12 +211,13 @@ impl State {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        // The camera uniform is consumed by the mesh shader, not a vertex shader.
         let camera_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Camera Bind Group Layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::MESH,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -213,23 +239,73 @@ impl State {
         let depth_texture =
             texture::Texture::create_depth_texture(&device, &config, "Depth texture");
 
+        // WGSL contains task + mesh + fragment entry points.
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
+        // Geometry + per-instance storage buffers for the mesh shader.
+        let mesh_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Mesh Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::MESH,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::MESH,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::MESH,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        // Pipeline layout order must match @group indices in WGSL:
+        // group(0)=mesh buffers, group(1)=camera, group(2)=texture/sampler.
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[&texture_bind_group_layout, &camera_bind_group_layout],
+                bind_group_layouts: &[
+                    &mesh_bind_group_layout,
+                    &camera_bind_group_layout,
+                    &texture_bind_group_layout,
+                ],
                 immediate_size: 0,
             });
 
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        // Mesh pipeline: task + mesh + fragment (no vertex stage).
+        let render_pipeline = device.create_mesh_pipeline(&wgpu::MeshPipelineDescriptor {
             label: Some("Render Pipeline"),
             layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
+            task: Some(wgpu::TaskState {
                 module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Vertex::desc(), InstanceRaw::desc()],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                entry_point: Some("ts_main"),
+                compilation_options: Default::default(),
+            }),
+            mesh: wgpu::MeshState {
+                module: &shader,
+                entry_point: Some("ms_main"),
+                compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -262,25 +338,25 @@ impl State {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview_mask: None,
+            multiview: None,
             cache: None,
         });
 
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(VERTICES),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(INDICES),
-            usage: wgpu::BufferUsages::INDEX,
-        });
+        // Convert classic vertex/index data into storage-buffer-friendly layouts.
+        let vertex_storage: Vec<VertexStorage> = VERTICES
+            .iter()
+            .map(|v| VertexStorage {
+                position: [v.position[0], v.position[1], v.position[2], 1.0],
+                tex_coords: v.tex_coords,
+                _pad: [0.0, 0.0],
+            })
+            .collect();
+        let index_storage: Vec<u32> = INDICES.iter().map(|&i| i as u32).collect();
 
         let instances: Vec<Instance> =
             iproduct!(0..NUM_INSTANCES_PER_ROW, 0..NUM_INSTANCES_PER_ROW)
                 .map(|(x, z)| {
-                    let position = glam::Vec3::new(x as f32 * 0.9, 0.0, z as f32 * 0.9);
+                    let position = glam::Vec3::new(x as f32, 0.0, z as f32) - INSTANCE_DISPLACEMENT;
                     let rotation = if position == glam::Vec3::ZERO {
                         glam::Quat::from_axis_angle(glam::Vec3::Z, 0.0)
                     } else {
@@ -295,10 +371,41 @@ impl State {
                 .collect();
 
         let instance_data: Vec<InstanceRaw> = instances.iter().map(Instance::to_raw).collect();
-        let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Instance Buffer"),
-            contents: bytemuck::cast_slice(&instance_data),
-            usage: wgpu::BufferUsages::VERTEX,
+        let vertex_storage_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Storage Buffer"),
+            contents: bytemuck::cast_slice(&vertex_storage),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let index_storage_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Index Storage Buffer"),
+            contents: bytemuck::cast_slice(&index_storage),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let instance_storage_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Instance Storage Buffer"),
+                contents: bytemuck::cast_slice(&instance_data),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+        // Bind group for mesh shader inputs (all storage buffers).
+        let mesh_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Mesh Bind Group"),
+            layout: &mesh_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: vertex_storage_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: index_storage_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: instance_storage_buffer.as_entire_binding(),
+                },
+            ],
         });
 
         Ok(Self {
@@ -315,13 +422,13 @@ impl State {
             camera_bind_group,
             depth_texture,
             render_pipeline,
-            vertex_buffer,
-            index_buffer,
-            num_indices: INDICES.len() as u32,
+            mesh_bind_group,
+            vertex_storage_buffer,
+            index_storage_buffer,
             diffuse_bind_group,
             diffuse_texture,
             instances,
-            instance_buffer,
+            instance_storage_buffer,
         })
     }
 
@@ -395,12 +502,12 @@ impl State {
             });
 
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
+            render_pass.set_bind_group(0, &self.mesh_bind_group, &[]);
             render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
-            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..self.num_indices, 0, 0..self.instances.len() as _);
+            render_pass.set_bind_group(2, &self.diffuse_bind_group, &[]);
+            // Mesh dispatch is like compute: X/Y/Z = task workgroup grid size.
+            // Our task shader interprets workgroup_id.x as the instance index.
+            render_pass.draw_mesh_tasks(self.instances.len() as u32, 1, 1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
