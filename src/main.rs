@@ -171,7 +171,7 @@ impl State {
             target: glam::Vec3::new(0.0, 0.0, 0.0),
             up: glam::Vec3::Y,
             aspect: config.width as f32 / config.height as f32,
-            fovy: 45.0,
+            fovy: 30.0_f32.to_radians(),
             znear: 0.1,
             zfar: 100.0,
         };
@@ -270,8 +270,8 @@ impl State {
 
         let instances: Vec<Instance> =
             iproduct!(0..NUM_INSTANCES_PER_ROW, 0..NUM_INSTANCES_PER_ROW)
-                .map(|(z, x)| {
-                    let position = glam::Vec3::new(x as f32, 0.0, z as f32);
+                .map(|(x, z)| {
+                    let position = glam::Vec3::new(x as f32 * 0.9, 0.0, z as f32 * 0.9);
                     let rotation = if position == glam::Vec3::ZERO {
                         glam::Quat::from_axis_angle(glam::Vec3::Z, 0.0)
                     } else {
