@@ -43,6 +43,7 @@ const MAX_MESHLET_PRIMS: u32 = 126u;
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) tex_coords: vec2<f32>,
+    @location(1) color: vec3<f32>,
 }
 
 struct PrimitiveOutput {
@@ -81,6 +82,12 @@ fn ms_main(@builtin(workgroup_id) wg: vec3<u32>) {
         let v = vertices[global_index];
         mesh_out.vertices[i].clip_position = camera.view_proj * v.position;
         mesh_out.vertices[i].tex_coords = v.tex_coords;
+        // Simple hash-based color per meshlet.
+        let h = meshlet_id * 1664525u + 1013904223u;
+        let r = f32((h >> 0u) & 255u) / 255.0;
+        let g = f32((h >> 8u) & 255u) / 255.0;
+        let b = f32((h >> 16u) & 255u) / 255.0;
+        mesh_out.vertices[i].color = vec3<f32>(r, g, b);
         i = i + 1u;
     }
 
@@ -101,5 +108,6 @@ fn ms_main(@builtin(workgroup_id) wg: vec3<u32>) {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(t_diffuse, s_diffuse, in.tex_coords);
+    // Visualize meshlet IDs via color (ignore texture for now).
+    return vec4<f32>(in.color, 1.0);
 }

@@ -2,6 +2,7 @@ mod camera;
 mod texture;
 
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::sync::{Arc, mpsc};
 
 use wgpu::util::DeviceExt as _;
@@ -47,6 +48,8 @@ pub struct State {
     meshlet_count: u32,
     max_task_workgroups_per_dimension: u32,
     max_task_workgroup_total_count: u32,
+    meshlet_params_stride: u64,
+    meshlet_params_draws: u32,
 }
 
 #[repr(C)]
@@ -202,16 +205,16 @@ impl State {
         });
 
         let camera = Camera {
-            eye: glam::Vec3::new(0.0, 1.0, 2.0),
-            target: glam::Vec3::new(0.0, 0.0, 0.0),
+            eye: glam::Vec3::new(0.0, 3.0, 2.0),
+            target: glam::Vec3::new(0.0, 0.1, 0.0),
             up: glam::Vec3::Y,
             aspect: config.width as f32 / config.height as f32,
-            fovy: 30.0_f32.to_radians(),
+            fovy: 60.0_f32.to_radians(),
             znear: 0.1,
             zfar: 100.0,
         };
 
-        let camera_controller = CameraController::new(0.1);
+        let camera_controller = CameraController::new(0.03);
 
         let camera_uniform = CameraUniform::new(&camera);
 
@@ -308,7 +311,7 @@ impl State {
                     visibility: wgpu::ShaderStages::MESH,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
+                        has_dynamic_offset: true,
                         min_binding_size: None,
                     },
                     count: None,
@@ -493,14 +496,37 @@ impl State {
             contents: bytemuck::cast_slice(&meshlet_descs),
             usage: wgpu::BufferUsages::STORAGE,
         });
+        let meshlet_count = meshlet_descs.len() as u32;
+        let max_x = device_limits
+            .max_task_mesh_workgroups_per_dimension
+            .min(device_limits.max_task_mesh_workgroup_total_count);
+        let mut params = Vec::new();
+        let mut base = 0u32;
+        while base < meshlet_count {
+            let remaining = meshlet_count - base;
+            let x = remaining.min(max_x);
+            params.push(MeshletParams {
+                base_meshlet: base,
+                meshlet_count,
+                _pad: [0, 0],
+            });
+            base += x;
+        }
+        let stride = {
+            let align = device_limits.min_uniform_buffer_offset_alignment as u64;
+            let size = std::mem::size_of::<MeshletParams>() as u64;
+            ((size + align - 1) / align) * align
+        };
+        let mut params_bytes = vec![0u8; (stride as usize) * params.len()];
+        for (i, p) in params.iter().enumerate() {
+            let bytes = bytemuck::bytes_of(p);
+            let offset = i * stride as usize;
+            params_bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+        }
         let meshlet_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Meshlet Params Buffer"),
-            contents: bytemuck::bytes_of(&MeshletParams {
-                base_meshlet: 0,
-                meshlet_count: meshlet_descs.len() as u32,
-                _pad: [0, 0],
-            }),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            contents: &params_bytes,
+            usage: wgpu::BufferUsages::UNIFORM,
         });
 
         // Bind group for mesh shader inputs (all storage buffers).
@@ -531,11 +557,13 @@ impl State {
             layout: &meshlet_params_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: meshlet_params_buffer.as_entire_binding(),
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &meshlet_params_buffer,
+                    offset: 0,
+                    size: NonZeroU64::new(stride),
+                }),
             }],
         });
-
-        let meshlet_count = meshlet_descs.len() as u32;
 
         Ok(Self {
             surface,
@@ -561,9 +589,10 @@ impl State {
             diffuse_bind_group,
             diffuse_texture,
             meshlet_count,
-            max_task_workgroups_per_dimension: device_limits
-                .max_task_mesh_workgroups_per_dimension,
+            max_task_workgroups_per_dimension: device_limits.max_task_mesh_workgroups_per_dimension,
             max_task_workgroup_total_count: device_limits.max_task_mesh_workgroup_total_count,
+            meshlet_params_stride: stride,
+            meshlet_params_draws: params.len() as u32,
         })
     }
 
@@ -644,22 +673,15 @@ impl State {
                 .max_task_workgroups_per_dimension
                 .min(self.max_task_workgroup_total_count);
             let mut base = 0u32;
-            while base < self.meshlet_count {
+            let mut draw_index = 0u32;
+            while base < self.meshlet_count && draw_index < self.meshlet_params_draws {
                 let remaining = self.meshlet_count - base;
                 let x = remaining.min(max_x);
-                let params = MeshletParams {
-                    base_meshlet: base,
-                    meshlet_count: self.meshlet_count,
-                    _pad: [0, 0],
-                };
-                self.queue.write_buffer(
-                    &self.meshlet_params_buffer,
-                    0,
-                    bytemuck::bytes_of(&params),
-                );
-                render_pass.set_bind_group(3, &self.meshlet_params_bind_group, &[]);
+                let offset = self.meshlet_params_stride * draw_index as u64;
+                render_pass.set_bind_group(3, &self.meshlet_params_bind_group, &[offset as u32]);
                 render_pass.draw_mesh_tasks(x, 1, 1);
                 base += x;
+                draw_index += 1;
             }
         }
 
