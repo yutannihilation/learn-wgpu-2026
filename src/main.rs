@@ -12,7 +12,7 @@ use winit::{
     window::{Window, WindowAttributes},
 };
 
-use crate::camera::{Camera, CameraUniform};
+use crate::camera::{Camera, CameraController, CameraUniform};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -58,6 +58,7 @@ pub struct State {
     is_surface_configured: bool,
     window: Arc<Box<dyn Window>>,
     camera: Camera,
+    camera_controller: CameraController,
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
@@ -192,6 +193,8 @@ impl State {
             zfar: 100.0,
         };
 
+        let camera_controller = CameraController::new(0.1);
+
         let camera_uniform = CameraUniform::new(&camera);
 
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -290,6 +293,7 @@ impl State {
             is_surface_configured,
             window,
             camera,
+            camera_controller,
             camera_uniform,
             camera_buffer,
             camera_bind_group,
@@ -312,7 +316,13 @@ impl State {
     }
 
     fn update(&mut self) {
-        // remove `todo!()`
+        self.camera_controller.update_camera(&mut self.camera);
+        self.camera_uniform.update_view_proj(&self.camera);
+        self.queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            bytemuck::cast_slice(&[self.camera_uniform]),
+        );
     }
 
     pub fn render(&self) -> Result<(), wgpu::SurfaceError> {
@@ -370,14 +380,16 @@ impl State {
     }
 
     fn handle_key(
-        &self,
+        &mut self,
         event_loop: &(dyn ActiveEventLoop + 'static),
         code: KeyCode,
         is_pressed: bool,
     ) {
         match (code, is_pressed) {
             (KeyCode::Escape, true) => event_loop.exit(),
-            _ => {}
+            _ => {
+                self.camera_controller.handle_key(code, is_pressed);
+            }
         }
     }
 }
