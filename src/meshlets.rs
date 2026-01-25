@@ -1,4 +1,4 @@
-use meshopt::{build_meshlets, typed_to_bytes, VertexDataAdapter};
+use meshopt::{VertexDataAdapter, build_meshlets, simplify, typed_to_bytes, SimplifyOptions};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -26,10 +26,18 @@ pub struct MeshletData {
     pub meshlet_descs: Vec<MeshletDesc>,
 }
 
+/// Load an OBJ mesh and build meshlets using meshoptimizer.
+/// Returns:
+/// - vertex_storage: full vertex buffer for mesh shader
+/// - meshlet_vertices: local->global vertex remap per meshlet
+/// - meshlet_indices: local triangle indices per meshlet
+/// - meshlet_descs: offsets/counts into the meshlet buffers
+/// `lod_ratio` in (0, 1] controls simplification amount (1.0 = full detail).
 pub fn load_obj_meshlets(
     path: &str,
     max_meshlet_verts: usize,
     max_meshlet_prims: usize,
+    lod_ratio: f32,
 ) -> anyhow::Result<MeshletData> {
     let (models, _materials) = tobj::load_obj(
         path,
@@ -65,13 +73,39 @@ pub fn load_obj_meshlets(
         });
     }
 
-    let indices = &mesh.indices;
+    let mut indices = mesh.indices.clone();
+    if lod_ratio < 1.0 {
+        let target_index_count =
+            ((indices.len() as f32) * lod_ratio).floor() as usize / 3 * 3;
+        let target_index_count = target_index_count.max(3);
+        let vertex_adapter = VertexDataAdapter::new(
+            typed_to_bytes(&mesh.positions),
+            3 * std::mem::size_of::<f32>(),
+            0,
+        )?;
+        indices = simplify(
+            &indices,
+            &vertex_adapter,
+            target_index_count,
+            1e-3,
+            SimplifyOptions::None,
+            None,
+        );
+    }
+    // Provide meshopt with a view of raw position data (xyz f32).
     let vertex_adapter = VertexDataAdapter::new(
         typed_to_bytes(&mesh.positions),
         3 * std::mem::size_of::<f32>(),
         0,
     )?;
-    let meshlets = build_meshlets(indices, &vertex_adapter, max_meshlet_verts, max_meshlet_prims, 0.0);
+    // Build meshlets with meshoptimizer; cone_weight=0 disables cone culling data.
+    let meshlets = build_meshlets(
+        &indices,
+        &vertex_adapter,
+        max_meshlet_verts,
+        max_meshlet_prims,
+        0.0,
+    );
 
     let mut meshlet_descs = Vec::with_capacity(meshlets.len());
     for meshlet in &meshlets.meshlets {

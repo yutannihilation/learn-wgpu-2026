@@ -1,16 +1,21 @@
 // Mesh shaders are an experimental WGSL extension in wgpu.
+// This shader renders meshlets (small clusters) generated on the CPU.
 enable wgpu_mesh_shader;
 
 struct CameraUniform {
     view_proj: mat4x4<f32>,
 }
 
+// Vertex data comes from a storage buffer (no vertex stage).
 struct VertexInput {
     position: vec4<f32>,
     tex_coords: vec2<f32>,
     _pad: vec2<f32>,
 }
 
+// Meshlet descriptor points into meshlet vertex/triangle buffers.
+// vertex_offset/count index meshlet_vertices.
+// index_offset/count index meshlet_indices (triangles).
 struct MeshletDesc {
     vertex_offset: u32,
     vertex_count: u32,
@@ -18,16 +23,24 @@ struct MeshletDesc {
     index_count: u32,
 }
 
+// Meshlet buffers (group 0).
+// - vertices: full vertex buffer
+// - meshlet_vertices: local->global vertex remap per meshlet
+// - meshlet_indices: local triangle indices per meshlet
+// - meshlets: meshlet descriptors (offsets/counts)
 @group(0) @binding(0) var<storage, read> vertices: array<VertexInput>;
 @group(0) @binding(1) var<storage, read> meshlet_vertices: array<u32>;
 @group(0) @binding(2) var<storage, read> meshlet_indices: array<u32>;
 @group(0) @binding(3) var<storage, read> meshlets: array<MeshletDesc>;
 
+// Camera uniform (group 1).
 @group(1) @binding(0) var<uniform> camera: CameraUniform;
 
+// Texture/sampler (group 2). Currently unused in fs_main.
 @group(2) @binding(0) var t_diffuse: texture_2d<f32>;
 @group(2) @binding(1) var s_diffuse: sampler;
 
+// Dynamic uniform used to offset meshlet IDs for chunked draws.
 struct MeshletParams {
     base_meshlet: u32,
     meshlet_count: u32,
@@ -35,21 +48,26 @@ struct MeshletParams {
     _pad1: u32,
 }
 
+// Meshlet params (group 3).
 @group(3) @binding(0) var<uniform> meshlet_params: MeshletParams;
 
 const MAX_MESHLET_VERTS: u32 = 64u;
 const MAX_MESHLET_PRIMS: u32 = 124u;
 
+// Vertex output to the fragment shader.
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) tex_coords: vec2<f32>,
     @location(1) color: vec3<f32>,
 }
 
+// Each primitive outputs triangle indices into the meshlet-local vertex list.
 struct PrimitiveOutput {
     @builtin(triangle_indices) indices: vec3<u32>,
 }
 
+// Mesh shader output arrays are per-workgroup.
+// We allocate fixed-size arrays and fill only [0..vertex_count/primitive_count).
 struct MeshOutput {
     @builtin(vertices) vertices: array<VertexOutput, MAX_MESHLET_VERTS>,
     @builtin(primitives) primitives: array<PrimitiveOutput, MAX_MESHLET_PRIMS>,
@@ -59,10 +77,12 @@ struct MeshOutput {
 
 var<workgroup> mesh_out: MeshOutput;
 
+// One mesh workgroup per meshlet.
 @mesh(mesh_out)
 @workgroup_size(1)
 fn ms_main(@builtin(workgroup_id) wg: vec3<u32>) {
     let meshlet_id = meshlet_params.base_meshlet + wg.x;
+    // Guard against out-of-range meshlet IDs in the final chunk.
     if (meshlet_id >= meshlet_params.meshlet_count) {
         mesh_out.vertex_count = 0u;
         mesh_out.primitive_count = 0u;
@@ -70,9 +90,11 @@ fn ms_main(@builtin(workgroup_id) wg: vec3<u32>) {
     }
     let meshlet = meshlets[meshlet_id];
 
+    // Tell the rasterizer how many vertices/primitives this workgroup emits.
     mesh_out.vertex_count = meshlet.vertex_count;
     mesh_out.primitive_count = meshlet.index_count;
 
+    // Emit transformed vertices for this meshlet.
     var i = 0u;
     loop {
         if (i >= meshlet.vertex_count) {
@@ -91,6 +113,7 @@ fn ms_main(@builtin(workgroup_id) wg: vec3<u32>) {
         i = i + 1u;
     }
 
+    // Emit per-triangle indices (local to this meshlet).
     var p = 0u;
     loop {
         if (p >= meshlet.index_count) {

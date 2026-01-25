@@ -18,6 +18,7 @@ use crate::meshlets::load_obj_meshlets;
 
 const MAX_MESHLET_VERTS: usize = 64;
 const MAX_MESHLET_PRIMS: usize = 124;
+const LOD_RATIO: f32 = 1.0;
 
 pub struct State {
     surface: wgpu::Surface<'static>,
@@ -35,15 +36,24 @@ pub struct State {
     // Mesh pipelines use the same handle type as render pipelines, but are created
     // with create_mesh_pipeline and executed via draw_mesh_tasks.
     render_pipeline: wgpu::RenderPipeline,
-    // Mesh shaders read geometry and per-instance data from storage buffers.
+    // Mesh shaders read geometry and meshlet data from storage buffers.
     mesh_bind_group: wgpu::BindGroup,
+    // Dynamic uniform used to select which meshlets each draw covers.
     meshlet_params_bind_group: wgpu::BindGroup,
+    // Keep GPU buffers alive; bind groups reference these.
+    _vertex_storage_buffer: wgpu::Buffer,
+    _meshlet_vertex_buffer: wgpu::Buffer,
+    _meshlet_index_buffer: wgpu::Buffer,
+    _meshlet_desc_buffer: wgpu::Buffer,
+    _meshlet_params_buffer: wgpu::Buffer,
     diffuse_bind_group: wgpu::BindGroup,
     meshlet_count: u32,
     max_task_workgroups_per_dimension: u32,
     max_task_workgroup_total_count: u32,
+    // Packed MeshletParams array for dynamic uniform offsets.
     meshlet_params_stride: u64,
     meshlet_params_draws: u32,
+    lod_ratio: f32,
 }
 
 #[repr(C)]
@@ -55,6 +65,131 @@ struct MeshletParams {
 }
 
 impl State {
+    fn rebuild_meshlets(&mut self, lod_ratio: f32) -> anyhow::Result<()> {
+        let meshlet_data = load_obj_meshlets(
+            "src/stanford-bunny.obj",
+            MAX_MESHLET_VERTS,
+            MAX_MESHLET_PRIMS,
+            lod_ratio,
+        )?;
+
+        let vertex_storage_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Vertex Storage Buffer"),
+                    contents: bytemuck::cast_slice(&meshlet_data.vertex_storage),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+        let meshlet_vertex_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Meshlet Vertex Buffer"),
+                    contents: bytemuck::cast_slice(&meshlet_data.meshlet_vertices),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+        let meshlet_index_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Meshlet Index Buffer"),
+                    contents: bytemuck::cast_slice(&meshlet_data.meshlet_indices),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+        let meshlet_desc_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Meshlet Desc Buffer"),
+                    contents: bytemuck::cast_slice(&meshlet_data.meshlet_descs),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+
+        let meshlet_count = meshlet_data.meshlet_descs.len() as u32;
+        let max_x = self
+            .max_task_workgroups_per_dimension
+            .min(self.max_task_workgroup_total_count);
+        let mut params = Vec::new();
+        let mut base = 0u32;
+        while base < meshlet_count {
+            let remaining = meshlet_count - base;
+            let x = remaining.min(max_x);
+            params.push(MeshletParams {
+                base_meshlet: base,
+                meshlet_count,
+                _pad: [0, 0],
+            });
+            base += x;
+        }
+        let stride = {
+            let align = self.device.limits().min_uniform_buffer_offset_alignment as u64;
+            let size = std::mem::size_of::<MeshletParams>() as u64;
+            ((size + align - 1) / align) * align
+        };
+        let mut params_bytes = vec![0u8; (stride as usize) * params.len()];
+        for (i, p) in params.iter().enumerate() {
+            let bytes = bytemuck::bytes_of(p);
+            let offset = i * stride as usize;
+            params_bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+        }
+        let meshlet_params_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Meshlet Params Buffer"),
+                    contents: &params_bytes,
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+
+        let mesh_bind_group_layout = self.render_pipeline.get_bind_group_layout(0);
+        let meshlet_params_bind_group_layout = self.render_pipeline.get_bind_group_layout(3);
+
+        let mesh_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Mesh Bind Group"),
+            layout: &mesh_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: vertex_storage_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: meshlet_vertex_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: meshlet_index_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: meshlet_desc_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let meshlet_params_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Meshlet Params Bind Group"),
+            layout: &meshlet_params_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &meshlet_params_buffer,
+                    offset: 0,
+                    size: NonZeroU64::new(stride),
+                }),
+            }],
+        });
+
+        self.mesh_bind_group = mesh_bind_group;
+        self.meshlet_params_bind_group = meshlet_params_bind_group;
+        self._vertex_storage_buffer = vertex_storage_buffer;
+        self._meshlet_vertex_buffer = meshlet_vertex_buffer;
+        self._meshlet_index_buffer = meshlet_index_buffer;
+        self._meshlet_desc_buffer = meshlet_desc_buffer;
+        self._meshlet_params_buffer = meshlet_params_buffer;
+        self.meshlet_count = meshlet_count;
+        self.meshlet_params_stride = stride;
+        self.meshlet_params_draws = params.len() as u32;
+        self.lod_ratio = lod_ratio;
+        Ok(())
+    }
+
     pub async fn new(window: Arc<Box<dyn Window>>) -> anyhow::Result<Self> {
         let size = window.surface_size();
 
@@ -352,11 +487,11 @@ impl State {
             cache: None,
         });
 
-        // Load the bunny mesh and build meshlets for the mesh shader.
         let meshlet_data = load_obj_meshlets(
             "src/stanford-bunny.obj",
             MAX_MESHLET_VERTS,
             MAX_MESHLET_PRIMS,
+            LOD_RATIO,
         )?;
 
         let vertex_storage_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -379,6 +514,7 @@ impl State {
             contents: bytemuck::cast_slice(&meshlet_data.meshlet_descs),
             usage: wgpu::BufferUsages::STORAGE,
         });
+
         let meshlet_count = meshlet_data.meshlet_descs.len() as u32;
         let max_x = device_limits
             .max_task_mesh_workgroups_per_dimension
@@ -412,7 +548,6 @@ impl State {
             usage: wgpu::BufferUsages::UNIFORM,
         });
 
-        // Bind group for mesh shader inputs (all storage buffers).
         let mesh_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Mesh Bind Group"),
             layout: &mesh_bind_group_layout,
@@ -435,6 +570,7 @@ impl State {
                 },
             ],
         });
+
         let meshlet_params_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Meshlet Params Bind Group"),
             layout: &meshlet_params_bind_group_layout,
@@ -464,12 +600,18 @@ impl State {
             render_pipeline,
             mesh_bind_group,
             meshlet_params_bind_group,
+            _vertex_storage_buffer: vertex_storage_buffer,
+            _meshlet_vertex_buffer: meshlet_vertex_buffer,
+            _meshlet_index_buffer: meshlet_index_buffer,
+            _meshlet_desc_buffer: meshlet_desc_buffer,
+            _meshlet_params_buffer: meshlet_params_buffer,
             diffuse_bind_group,
             meshlet_count,
             max_task_workgroups_per_dimension: device_limits.max_task_mesh_workgroups_per_dimension,
             max_task_workgroup_total_count: device_limits.max_task_mesh_workgroup_total_count,
             meshlet_params_stride: stride,
             meshlet_params_draws: params.len() as u32,
+            lod_ratio: LOD_RATIO,
         })
     }
 
@@ -555,6 +697,7 @@ impl State {
                 let remaining = self.meshlet_count - base;
                 let x = remaining.min(max_x);
                 let offset = self.meshlet_params_stride * draw_index as u64;
+                // Each draw reads a different MeshletParams entry via dynamic offset.
                 render_pass.set_bind_group(3, &self.meshlet_params_bind_group, &[offset as u32]);
                 render_pass.draw_mesh_tasks(x, 1, 1);
                 base += x;
@@ -576,6 +719,18 @@ impl State {
     ) {
         match (code, is_pressed) {
             (KeyCode::Escape, true) => event_loop.exit(),
+            (KeyCode::PageUp, true) => {
+                let next = (self.lod_ratio * 2.0).min(1.0);
+                if let Err(err) = self.rebuild_meshlets(next) {
+                    eprintln!("Failed to increase LOD: {err}");
+                }
+            }
+            (KeyCode::PageDown, true) => {
+                let next = (self.lod_ratio * 0.5).max(0.005);
+                if let Err(err) = self.rebuild_meshlets(next) {
+                    eprintln!("Failed to decrease LOD: {err}");
+                }
+            }
             _ => {
                 self.camera_controller.handle_key(code, is_pressed);
             }
