@@ -120,6 +120,10 @@ impl State {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
+        println!(
+            "Surface config: format={:?}, present_mode={:?}, alpha_mode={:?}, size={}x{}",
+            config.format, config.present_mode, config.alpha_mode, config.width, config.height
+        );
         let mut is_surface_configured = false;
         if config.width > 0 && config.height > 0 {
             surface.configure(&device, &config);
