@@ -90,16 +90,41 @@ impl State {
             })
             .await?;
 
-        let config = wgpu::SurfaceConfiguration {
+        let surface_caps = surface.get_capabilities(&adapter);
+        let surface_format = surface_caps
+            .formats
+            .iter()
+            .copied()
+            .find(|format| format.is_srgb())
+            .unwrap_or(surface_caps.formats[0]);
+        let present_mode = surface_caps
+            .present_modes
+            .iter()
+            .copied()
+            .find(|mode| *mode == wgpu::PresentMode::Fifo)
+            .unwrap_or(surface_caps.present_modes[0]);
+        let alpha_mode = surface_caps
+            .alpha_modes
+            .iter()
+            .copied()
+            .find(|mode| *mode == wgpu::CompositeAlphaMode::Auto)
+            .unwrap_or(surface_caps.alpha_modes[0]);
+
+        let mut config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: surface_format,
             width: size.width,
             height: size.height,
-            present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            present_mode,
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
+        let mut is_surface_configured = false;
+        if config.width > 0 && config.height > 0 {
+            surface.configure(&device, &config);
+            is_surface_configured = true;
+        }
 
         let diffuse_bytes = include_bytes!("happy-tree.png");
         let diffuse_image = image::load_from_memory(diffuse_bytes).unwrap();
@@ -250,7 +275,7 @@ impl State {
             device,
             queue,
             config,
-            is_surface_configured: false,
+            is_surface_configured,
             window,
             render_pipeline,
             vertex_buffer,
@@ -314,7 +339,7 @@ impl State {
             });
 
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
+            // render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
