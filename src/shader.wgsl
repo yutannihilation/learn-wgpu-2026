@@ -27,6 +27,11 @@ struct TaskPayload {
 @group(0) @binding(0) var<storage, read> vertices: array<VertexInput>;
 @group(0) @binding(1) var<storage, read> indices: array<u32>;
 @group(0) @binding(2) var<storage, read> instances: array<InstanceInput>;
+@group(0) @binding(3) var<storage, read_write> dispatch_args: DispatchIndirect;
+// Compute writes visibility flags here.
+@group(0) @binding(4) var<storage, read_write> meshlet_visible_rw: array<u32>;
+// Mesh shader reads visibility flags here.
+@group(0) @binding(5) var<storage, read> meshlet_visible: array<u32>;
 
 // Camera uniform (group 1).
 @group(1) @binding(0) var<uniform> camera: CameraUniform;
@@ -42,6 +47,7 @@ struct VertexOutput {
 
 struct PrimitiveOutput {
     @builtin(triangle_indices) indices: vec3<u32>,
+    @builtin(cull_primitive) cull: bool,
 }
 
 // Mesh shader outputs are per-workgroup. We must provide:
@@ -55,8 +61,37 @@ struct MeshOutput {
     @builtin(primitive_count) primitive_count: u32,
 }
 
+// Layout for draw_mesh_tasks_indirect dispatch arguments.
+struct DispatchIndirect {
+    x: u32,
+    y: u32,
+    z: u32,
+}
+
 var<task_payload> payload: TaskPayload;
 var<workgroup> mesh_out: MeshOutput;
+
+// Compute stage that builds the indirect dispatch arguments on the GPU.
+// This is the "GPU-driven" step: the CPU never decides the mesh task count.
+@compute
+@workgroup_size(1)
+fn cs_main() {
+    let instance_count = arrayLength(&instances);
+    dispatch_args.x = instance_count;
+    dispatch_args.y = 1u;
+    dispatch_args.z = 1u;
+
+    // Example visibility: keep even instances, cull odd ones.
+    // Replace this with frustum/occlusion logic as needed.
+    var i = 0u;
+    loop {
+        if (i >= instance_count) {
+            break;
+        }
+        meshlet_visible_rw[i] = select(0u, 1u, (i & 1u) == 0u);
+        i = i + 1u;
+    }
+}
 
 @task
 @payload(payload)
@@ -96,6 +131,12 @@ fn ms_main() {
     mesh_out.primitives[0].indices = vec3<u32>(indices[0], indices[1], indices[2]);
     mesh_out.primitives[1].indices = vec3<u32>(indices[3], indices[4], indices[5]);
     mesh_out.primitives[2].indices = vec3<u32>(indices[6], indices[7], indices[8]);
+
+    // Read visibility computed by the compute pass.
+    let visible = meshlet_visible[instance_index] != 0u;
+    mesh_out.primitives[0].cull = !visible;
+    mesh_out.primitives[1].cull = !visible;
+    mesh_out.primitives[2].cull = !visible;
 }
 
 @fragment
