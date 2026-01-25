@@ -1,9 +1,9 @@
 use winit::keyboard::KeyCode;
 
 pub struct Camera {
-    pub(crate) eye: glam::Vec3A,
-    pub(crate) target: glam::Vec3A,
-    pub(crate) up: glam::Vec3A,
+    pub(crate) eye: glam::Vec3,
+    pub(crate) target: glam::Vec3,
+    pub(crate) up: glam::Vec3,
     pub(crate) aspect: f32,
     pub(crate) fovy: f32,
     pub(crate) znear: f32,
@@ -12,7 +12,7 @@ pub struct Camera {
 
 impl Camera {
     fn build_view_projection_matrix(&self) -> glam::Mat4 {
-        let view = glam::Mat4::look_at_rh(self.eye.into(), self.target.into(), self.up.into());
+        let view = glam::Mat4::look_at_rh(self.eye, self.target, self.up);
         let proj = glam::Mat4::perspective_rh_gl(self.fovy, self.aspect, self.znear, self.zfar);
 
         proj * view

@@ -1,4 +1,5 @@
 mod camera;
+mod instance;
 mod texture;
 mod vertex;
 
@@ -150,9 +151,9 @@ impl State {
         });
 
         let camera = Camera {
-            eye: glam::Vec3A::new(0.0, 1.0, 2.0),
-            target: glam::Vec3A::new(0.0, 0.0, 0.0),
-            up: glam::Vec3A::Y,
+            eye: glam::Vec3::new(0.0, 1.0, 2.0),
+            target: glam::Vec3::new(0.0, 0.0, 0.0),
+            up: glam::Vec3::Y,
             aspect: config.width as f32 / config.height as f32,
             fovy: 45.0,
             znear: 0.1,
