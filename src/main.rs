@@ -1,11 +1,9 @@
 mod camera;
-mod instance;
 mod texture;
-mod vertex;
 
+use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
 
-use itertools::iproduct;
 use wgpu::util::DeviceExt as _;
 use winit::{
     application::ApplicationHandler,
@@ -15,21 +13,10 @@ use winit::{
     window::{Window, WindowAttributes},
 };
 
-use crate::{
-    camera::{Camera, CameraController, CameraUniform},
-    instance::Instance,
-};
-use crate::{
-    instance::InstanceRaw,
-    vertex::{INDICES, VERTICES},
-};
+use crate::camera::{Camera, CameraController, CameraUniform};
 
-const NUM_INSTANCES_PER_ROW: u32 = 10;
-const INSTANCE_DISPLACEMENT: glam::Vec3 = glam::Vec3::new(
-    NUM_INSTANCES_PER_ROW as f32 * 0.5,
-    0.0,
-    NUM_INSTANCES_PER_ROW as f32 * 0.5,
-);
+const MAX_MESHLET_VERTS: usize = 64;
+const MAX_MESHLET_PRIMS: usize = 126;
 
 pub struct State {
     surface: wgpu::Surface<'static>,
@@ -47,22 +34,19 @@ pub struct State {
     // Mesh pipelines use the same handle type as render pipelines, but are created
     // with create_mesh_pipeline and executed via draw_mesh_tasks.
     render_pipeline: wgpu::RenderPipeline,
-    // Compute pipeline that writes the indirect dispatch args buffer.
-    compute_pipeline: wgpu::ComputePipeline,
     // Mesh shaders read geometry and per-instance data from storage buffers.
     mesh_bind_group: wgpu::BindGroup,
-    // Compute bind group includes the indirect args buffer for GPU-driven dispatch.
-    compute_bind_group: wgpu::BindGroup,
     vertex_storage_buffer: wgpu::Buffer,
-    index_storage_buffer: wgpu::Buffer,
-    // Indirect dispatch arguments written by the compute shader.
-    indirect_args_buffer: wgpu::Buffer,
-    // Visibility flags written by compute and read by mesh shader.
-    visibility_buffer: wgpu::Buffer,
+    meshlet_vertex_buffer: wgpu::Buffer,
+    meshlet_index_buffer: wgpu::Buffer,
+    meshlet_desc_buffer: wgpu::Buffer,
+    meshlet_params_buffer: wgpu::Buffer,
+    meshlet_params_bind_group: wgpu::BindGroup,
     diffuse_bind_group: wgpu::BindGroup,
     diffuse_texture: texture::Texture,
-    instances: Vec<Instance>,
-    instance_storage_buffer: wgpu::Buffer,
+    meshlet_count: u32,
+    max_task_workgroups_per_dimension: u32,
+    max_task_workgroup_total_count: u32,
 }
 
 #[repr(C)]
@@ -73,6 +57,23 @@ struct VertexStorage {
     position: [f32; 4],
     tex_coords: [f32; 2],
     _pad: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MeshletDesc {
+    vertex_offset: u32,
+    vertex_count: u32,
+    index_offset: u32,
+    index_count: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MeshletParams {
+    base_meshlet: u32,
+    meshlet_count: u32,
+    _pad: [u32; 2],
 }
 
 impl State {
@@ -115,6 +116,7 @@ impl State {
                 trace: wgpu::Trace::Off,
             })
             .await?;
+        let device_limits = device.limits();
 
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps
@@ -247,10 +249,10 @@ impl State {
         let depth_texture =
             texture::Texture::create_depth_texture(&device, &config, "Depth texture");
 
-        // WGSL contains task + mesh + fragment entry points.
+        // WGSL contains mesh + fragment entry points.
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
-        // Geometry + per-instance storage buffers for the mesh shader.
+        // Geometry + meshlet storage buffers for the mesh shader.
         let mesh_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Mesh Bind Group Layout"),
@@ -286,17 +288,7 @@ impl State {
                         count: None,
                     },
                     wgpu::BindGroupLayoutEntry {
-                        binding: 4,
-                        visibility: wgpu::ShaderStages::MESH,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 5,
+                        binding: 3,
                         visibility: wgpu::ShaderStages::MESH,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -308,71 +300,19 @@ impl State {
                 ],
             });
 
-        let compute_bind_group_layout =
+        let meshlet_params_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Compute Bind Group Layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+                label: Some("Meshlet Params Bind Group Layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::MESH,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 4,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 5,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
+                    count: None,
+                }],
             });
 
         // Pipeline layout order must match @group indices in WGSL:
@@ -384,6 +324,7 @@ impl State {
                     &mesh_bind_group_layout,
                     &camera_bind_group_layout,
                     &texture_bind_group_layout,
+                    &meshlet_params_bind_group_layout,
                 ],
                 immediate_size: 0,
             });
@@ -392,11 +333,7 @@ impl State {
         let render_pipeline = device.create_mesh_pipeline(&wgpu::MeshPipelineDescriptor {
             label: Some("Render Pipeline"),
             layout: Some(&render_pipeline_layout),
-            task: Some(wgpu::TaskState {
-                module: &shader,
-                entry_point: Some("ts_main"),
-                compilation_options: Default::default(),
-            }),
+            task: None,
             mesh: wgpu::MeshState {
                 module: &shader,
                 entry_point: Some("ms_main"),
@@ -437,79 +374,134 @@ impl State {
             cache: None,
         });
 
-        let compute_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Compute Pipeline Layout"),
-                bind_group_layouts: &[&compute_bind_group_layout],
-                immediate_size: 0,
-            });
+        // Load the bunny mesh and build meshlets for the mesh shader.
+        let (models, _materials) = tobj::load_obj(
+            "src/stanford-bunny.obj",
+            &tobj::LoadOptions {
+                triangulate: true,
+                single_index: true,
+                ..Default::default()
+            },
+        )?;
+        let mesh = &models
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No meshes found in OBJ"))?
+            .mesh;
 
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Mesh Indirect Compute Pipeline"),
-            layout: Some(&compute_pipeline_layout),
-            module: &shader,
-            entry_point: Some("cs_main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
-
-        // Convert classic vertex/index data into storage-buffer-friendly layouts.
-        let vertex_storage: Vec<VertexStorage> = VERTICES
-            .iter()
-            .map(|v| VertexStorage {
-                position: [v.position[0], v.position[1], v.position[2], 1.0],
-                tex_coords: v.tex_coords,
+        let vertex_count = mesh.positions.len() / 3;
+        let mut vertex_storage = Vec::with_capacity(vertex_count);
+        for i in 0..vertex_count {
+            let pos = [
+                mesh.positions[i * 3],
+                mesh.positions[i * 3 + 1],
+                mesh.positions[i * 3 + 2],
+                1.0,
+            ];
+            let tex_coords = if mesh.texcoords.len() >= (i * 2 + 2) {
+                [mesh.texcoords[i * 2], mesh.texcoords[i * 2 + 1]]
+            } else {
+                [0.0, 0.0]
+            };
+            vertex_storage.push(VertexStorage {
+                position: pos,
+                tex_coords,
                 _pad: [0.0, 0.0],
-            })
-            .collect();
-        let index_storage: Vec<u32> = INDICES.iter().map(|&i| i as u32).collect();
+            });
+        }
 
-        let instances: Vec<Instance> =
-            iproduct!(0..NUM_INSTANCES_PER_ROW, 0..NUM_INSTANCES_PER_ROW)
-                .map(|(x, z)| {
-                    let position = glam::Vec3::new(x as f32, 0.0, z as f32) - INSTANCE_DISPLACEMENT;
-                    let rotation = if position == glam::Vec3::ZERO {
-                        glam::Quat::from_axis_angle(glam::Vec3::Z, 0.0)
-                    } else {
-                        glam::Quat::from_axis_angle(
-                            position.normalize(),
-                            std::f32::consts::FRAC_PI_4,
-                        )
-                    };
+        let indices = &mesh.indices;
+        let mut meshlet_descs: Vec<MeshletDesc> = Vec::new();
+        let mut meshlet_vertices: Vec<u32> = Vec::new();
+        let mut meshlet_indices: Vec<u32> = Vec::new();
 
-                    Instance { position, rotation }
-                })
-                .collect();
+        let mut current_map: HashMap<u32, u32> = HashMap::new();
+        let mut current_vertex_offset = 0u32;
+        let mut current_index_offset = 0u32;
+        let mut current_vertex_count = 0u32;
+        let mut current_prim_count = 0u32;
 
-        let instance_data: Vec<InstanceRaw> = instances.iter().map(Instance::to_raw).collect();
+        for tri in indices.chunks(3) {
+            if tri.len() < 3 {
+                break;
+            }
+            let tri_indices = [tri[0], tri[1], tri[2]];
+            let mut new_vertices = 0u32;
+            for &idx in &tri_indices {
+                if !current_map.contains_key(&idx) {
+                    new_vertices += 1;
+                }
+            }
+            if current_vertex_count + new_vertices > MAX_MESHLET_VERTS as u32
+                || current_prim_count + 1 > MAX_MESHLET_PRIMS as u32
+            {
+                if current_prim_count > 0 {
+                    meshlet_descs.push(MeshletDesc {
+                        vertex_offset: current_vertex_offset,
+                        vertex_count: current_vertex_count,
+                        index_offset: current_index_offset,
+                        index_count: current_prim_count,
+                    });
+                    current_vertex_offset = meshlet_vertices.len() as u32;
+                    current_index_offset = meshlet_indices.len() as u32;
+                    current_vertex_count = 0;
+                    current_prim_count = 0;
+                    current_map.clear();
+                }
+            }
+
+            for &idx in &tri_indices {
+                let local = if let Some(&local) = current_map.get(&idx) {
+                    local
+                } else {
+                    let local = current_vertex_count;
+                    current_map.insert(idx, local);
+                    meshlet_vertices.push(idx);
+                    current_vertex_count += 1;
+                    local
+                };
+                meshlet_indices.push(local);
+            }
+            current_prim_count += 1;
+        }
+
+        if current_prim_count > 0 {
+            meshlet_descs.push(MeshletDesc {
+                vertex_offset: current_vertex_offset,
+                vertex_count: current_vertex_count,
+                index_offset: current_index_offset,
+                index_count: current_prim_count,
+            });
+        }
+
         let vertex_storage_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Storage Buffer"),
             contents: bytemuck::cast_slice(&vertex_storage),
             usage: wgpu::BufferUsages::STORAGE,
         });
-        let index_storage_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Storage Buffer"),
-            contents: bytemuck::cast_slice(&index_storage),
+        let meshlet_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Meshlet Vertex Buffer"),
+            contents: bytemuck::cast_slice(&meshlet_vertices),
             usage: wgpu::BufferUsages::STORAGE,
         });
-        let indirect_args_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Mesh Indirect Args Buffer"),
-            size: std::mem::size_of::<wgpu::util::DispatchIndirectArgs>() as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
-            mapped_at_creation: false,
-        });
-        let visibility_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Mesh Visibility Buffer"),
-            size: (instance_data.len() * std::mem::size_of::<u32>()) as u64,
+        let meshlet_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Meshlet Index Buffer"),
+            contents: bytemuck::cast_slice(&meshlet_indices),
             usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
         });
-        let instance_storage_buffer =
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Instance Storage Buffer"),
-                contents: bytemuck::cast_slice(&instance_data),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
+        let meshlet_desc_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Meshlet Desc Buffer"),
+            contents: bytemuck::cast_slice(&meshlet_descs),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let meshlet_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Meshlet Params Buffer"),
+            contents: bytemuck::bytes_of(&MeshletParams {
+                base_meshlet: 0,
+                meshlet_count: meshlet_descs.len() as u32,
+                _pad: [0, 0],
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
 
         // Bind group for mesh shader inputs (all storage buffers).
         let mesh_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -522,53 +514,28 @@ impl State {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: index_storage_buffer.as_entire_binding(),
+                    resource: meshlet_vertex_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: instance_storage_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: visibility_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: visibility_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Compute Bind Group"),
-            layout: &compute_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: vertex_storage_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: index_storage_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: instance_storage_buffer.as_entire_binding(),
+                    resource: meshlet_index_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: indirect_args_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: visibility_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: visibility_buffer.as_entire_binding(),
+                    resource: meshlet_desc_buffer.as_entire_binding(),
                 },
             ],
         });
+        let meshlet_params_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Meshlet Params Bind Group"),
+            layout: &meshlet_params_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: meshlet_params_buffer.as_entire_binding(),
+            }],
+        });
+
+        let meshlet_count = meshlet_descs.len() as u32;
 
         Ok(Self {
             surface,
@@ -584,17 +551,19 @@ impl State {
             camera_bind_group,
             depth_texture,
             render_pipeline,
-            compute_pipeline,
             mesh_bind_group,
-            compute_bind_group,
             vertex_storage_buffer,
-            index_storage_buffer,
-            indirect_args_buffer,
-            visibility_buffer,
+            meshlet_vertex_buffer,
+            meshlet_index_buffer,
+            meshlet_desc_buffer,
+            meshlet_params_buffer,
+            meshlet_params_bind_group,
             diffuse_bind_group,
             diffuse_texture,
-            instances,
-            instance_storage_buffer,
+            meshlet_count,
+            max_task_workgroups_per_dimension: device_limits
+                .max_task_mesh_workgroups_per_dimension,
+            max_task_workgroup_total_count: device_limits.max_task_mesh_workgroup_total_count,
         })
     }
 
@@ -638,18 +607,6 @@ impl State {
             });
 
         {
-            // GPU-driven step: compute shader writes the mesh task count into the
-            // indirect dispatch buffer.
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Mesh Indirect Compute Pass"),
-                timestamp_writes: None,
-            });
-            compute_pass.set_pipeline(&self.compute_pipeline);
-            compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-            compute_pass.dispatch_workgroups(1, 1, 1);
-        }
-
-        {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -683,9 +640,27 @@ impl State {
             render_pass.set_bind_group(0, &self.mesh_bind_group, &[]);
             render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
             render_pass.set_bind_group(2, &self.diffuse_bind_group, &[]);
-            // Mesh dispatch is like compute: X/Y/Z = task workgroup grid size.
-            // Our task shader interprets workgroup_id.x as the instance index.
-            render_pass.draw_mesh_tasks_indirect(&self.indirect_args_buffer, 0);
+            let max_x = self
+                .max_task_workgroups_per_dimension
+                .min(self.max_task_workgroup_total_count);
+            let mut base = 0u32;
+            while base < self.meshlet_count {
+                let remaining = self.meshlet_count - base;
+                let x = remaining.min(max_x);
+                let params = MeshletParams {
+                    base_meshlet: base,
+                    meshlet_count: self.meshlet_count,
+                    _pad: [0, 0],
+                };
+                self.queue.write_buffer(
+                    &self.meshlet_params_buffer,
+                    0,
+                    bytemuck::bytes_of(&params),
+                );
+                render_pass.set_bind_group(3, &self.meshlet_params_bind_group, &[]);
+                render_pass.draw_mesh_tasks(x, 1, 1);
+                base += x;
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
