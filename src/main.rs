@@ -1,10 +1,9 @@
 mod camera;
+mod meshlets;
 mod texture;
 
-use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::{Arc, mpsc};
-
 use wgpu::util::DeviceExt as _;
 use winit::{
     application::ApplicationHandler,
@@ -15,9 +14,10 @@ use winit::{
 };
 
 use crate::camera::{Camera, CameraController, CameraUniform};
+use crate::meshlets::load_obj_meshlets;
 
 const MAX_MESHLET_VERTS: usize = 64;
-const MAX_MESHLET_PRIMS: usize = 126;
+const MAX_MESHLET_PRIMS: usize = 124;
 
 pub struct State {
     surface: wgpu::Surface<'static>,
@@ -37,38 +37,13 @@ pub struct State {
     render_pipeline: wgpu::RenderPipeline,
     // Mesh shaders read geometry and per-instance data from storage buffers.
     mesh_bind_group: wgpu::BindGroup,
-    vertex_storage_buffer: wgpu::Buffer,
-    meshlet_vertex_buffer: wgpu::Buffer,
-    meshlet_index_buffer: wgpu::Buffer,
-    meshlet_desc_buffer: wgpu::Buffer,
-    meshlet_params_buffer: wgpu::Buffer,
     meshlet_params_bind_group: wgpu::BindGroup,
     diffuse_bind_group: wgpu::BindGroup,
-    diffuse_texture: texture::Texture,
     meshlet_count: u32,
     max_task_workgroups_per_dimension: u32,
     max_task_workgroup_total_count: u32,
     meshlet_params_stride: u64,
     meshlet_params_draws: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct VertexStorage {
-    // Storage buffers align vec3 to 16 bytes in WGSL, so use vec4 and padding
-    // to keep the Rust/WGSL layouts compatible.
-    position: [f32; 4],
-    tex_coords: [f32; 2],
-    _pad: [f32; 2],
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct MeshletDesc {
-    vertex_offset: u32,
-    vertex_count: u32,
-    index_offset: u32,
-    index_count: u32,
 }
 
 #[repr(C)]
@@ -205,7 +180,7 @@ impl State {
         });
 
         let camera = Camera {
-            eye: glam::Vec3::new(0.0, 3.0, 2.0),
+            eye: glam::Vec3::new(0.0, 0.4, 0.4),
             target: glam::Vec3::new(0.0, 0.1, 0.0),
             up: glam::Vec3::Y,
             aspect: config.width as f32 / config.height as f32,
@@ -214,7 +189,7 @@ impl State {
             zfar: 100.0,
         };
 
-        let camera_controller = CameraController::new(0.03);
+        let camera_controller = CameraController::new(0.01);
 
         let camera_uniform = CameraUniform::new(&camera);
 
@@ -378,125 +353,33 @@ impl State {
         });
 
         // Load the bunny mesh and build meshlets for the mesh shader.
-        let (models, _materials) = tobj::load_obj(
+        let meshlet_data = load_obj_meshlets(
             "src/stanford-bunny.obj",
-            &tobj::LoadOptions {
-                triangulate: true,
-                single_index: true,
-                ..Default::default()
-            },
+            MAX_MESHLET_VERTS,
+            MAX_MESHLET_PRIMS,
         )?;
-        let mesh = &models
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("No meshes found in OBJ"))?
-            .mesh;
-
-        let vertex_count = mesh.positions.len() / 3;
-        let mut vertex_storage = Vec::with_capacity(vertex_count);
-        for i in 0..vertex_count {
-            let pos = [
-                mesh.positions[i * 3],
-                mesh.positions[i * 3 + 1],
-                mesh.positions[i * 3 + 2],
-                1.0,
-            ];
-            let tex_coords = if mesh.texcoords.len() >= (i * 2 + 2) {
-                [mesh.texcoords[i * 2], mesh.texcoords[i * 2 + 1]]
-            } else {
-                [0.0, 0.0]
-            };
-            vertex_storage.push(VertexStorage {
-                position: pos,
-                tex_coords,
-                _pad: [0.0, 0.0],
-            });
-        }
-
-        let indices = &mesh.indices;
-        let mut meshlet_descs: Vec<MeshletDesc> = Vec::new();
-        let mut meshlet_vertices: Vec<u32> = Vec::new();
-        let mut meshlet_indices: Vec<u32> = Vec::new();
-
-        let mut current_map: HashMap<u32, u32> = HashMap::new();
-        let mut current_vertex_offset = 0u32;
-        let mut current_index_offset = 0u32;
-        let mut current_vertex_count = 0u32;
-        let mut current_prim_count = 0u32;
-
-        for tri in indices.chunks(3) {
-            if tri.len() < 3 {
-                break;
-            }
-            let tri_indices = [tri[0], tri[1], tri[2]];
-            let mut new_vertices = 0u32;
-            for &idx in &tri_indices {
-                if !current_map.contains_key(&idx) {
-                    new_vertices += 1;
-                }
-            }
-            if current_vertex_count + new_vertices > MAX_MESHLET_VERTS as u32
-                || current_prim_count + 1 > MAX_MESHLET_PRIMS as u32
-            {
-                if current_prim_count > 0 {
-                    meshlet_descs.push(MeshletDesc {
-                        vertex_offset: current_vertex_offset,
-                        vertex_count: current_vertex_count,
-                        index_offset: current_index_offset,
-                        index_count: current_prim_count,
-                    });
-                    current_vertex_offset = meshlet_vertices.len() as u32;
-                    current_index_offset = meshlet_indices.len() as u32;
-                    current_vertex_count = 0;
-                    current_prim_count = 0;
-                    current_map.clear();
-                }
-            }
-
-            for &idx in &tri_indices {
-                let local = if let Some(&local) = current_map.get(&idx) {
-                    local
-                } else {
-                    let local = current_vertex_count;
-                    current_map.insert(idx, local);
-                    meshlet_vertices.push(idx);
-                    current_vertex_count += 1;
-                    local
-                };
-                meshlet_indices.push(local);
-            }
-            current_prim_count += 1;
-        }
-
-        if current_prim_count > 0 {
-            meshlet_descs.push(MeshletDesc {
-                vertex_offset: current_vertex_offset,
-                vertex_count: current_vertex_count,
-                index_offset: current_index_offset,
-                index_count: current_prim_count,
-            });
-        }
 
         let vertex_storage_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Storage Buffer"),
-            contents: bytemuck::cast_slice(&vertex_storage),
+            contents: bytemuck::cast_slice(&meshlet_data.vertex_storage),
             usage: wgpu::BufferUsages::STORAGE,
         });
         let meshlet_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Meshlet Vertex Buffer"),
-            contents: bytemuck::cast_slice(&meshlet_vertices),
+            contents: bytemuck::cast_slice(&meshlet_data.meshlet_vertices),
             usage: wgpu::BufferUsages::STORAGE,
         });
         let meshlet_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Meshlet Index Buffer"),
-            contents: bytemuck::cast_slice(&meshlet_indices),
+            contents: bytemuck::cast_slice(&meshlet_data.meshlet_indices),
             usage: wgpu::BufferUsages::STORAGE,
         });
         let meshlet_desc_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Meshlet Desc Buffer"),
-            contents: bytemuck::cast_slice(&meshlet_descs),
+            contents: bytemuck::cast_slice(&meshlet_data.meshlet_descs),
             usage: wgpu::BufferUsages::STORAGE,
         });
-        let meshlet_count = meshlet_descs.len() as u32;
+        let meshlet_count = meshlet_data.meshlet_descs.len() as u32;
         let max_x = device_limits
             .max_task_mesh_workgroups_per_dimension
             .min(device_limits.max_task_mesh_workgroup_total_count);
@@ -580,14 +463,8 @@ impl State {
             depth_texture,
             render_pipeline,
             mesh_bind_group,
-            vertex_storage_buffer,
-            meshlet_vertex_buffer,
-            meshlet_index_buffer,
-            meshlet_desc_buffer,
-            meshlet_params_buffer,
             meshlet_params_bind_group,
             diffuse_bind_group,
-            diffuse_texture,
             meshlet_count,
             max_task_workgroups_per_dimension: device_limits.max_task_mesh_workgroups_per_dimension,
             max_task_workgroup_total_count: device_limits.max_task_mesh_workgroup_total_count,

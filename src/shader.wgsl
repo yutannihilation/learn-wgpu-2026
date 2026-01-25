@@ -38,7 +38,7 @@ struct MeshletParams {
 @group(3) @binding(0) var<uniform> meshlet_params: MeshletParams;
 
 const MAX_MESHLET_VERTS: u32 = 64u;
-const MAX_MESHLET_PRIMS: u32 = 126u;
+const MAX_MESHLET_PRIMS: u32 = 124u;
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
