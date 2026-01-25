@@ -5,6 +5,7 @@ mod vertex;
 
 use std::sync::{Arc, mpsc};
 
+use itertools::iproduct;
 use wgpu::util::DeviceExt as _;
 use winit::{
     application::ApplicationHandler,
@@ -14,8 +15,21 @@ use winit::{
     window::{Window, WindowAttributes},
 };
 
-use crate::camera::{Camera, CameraController, CameraUniform};
-use crate::vertex::{INDICES, VERTICES, Vertex};
+use crate::{
+    camera::{Camera, CameraController, CameraUniform},
+    instance::Instance,
+};
+use crate::{
+    instance::InstanceRaw,
+    vertex::{INDICES, VERTICES, Vertex},
+};
+
+const NUM_INSTANCES_PER_ROW: u32 = 10;
+const INSTANCE_DISPLACEMENT: glam::Vec3 = glam::Vec3::new(
+    NUM_INSTANCES_PER_ROW as f32 * 0.5,
+    0.0,
+    NUM_INSTANCES_PER_ROW as f32 * 0.5,
+);
 
 pub struct State {
     surface: wgpu::Surface<'static>,
@@ -35,6 +49,8 @@ pub struct State {
     num_indices: u32,
     diffuse_bind_group: wgpu::BindGroup,
     diffuse_texture: texture::Texture,
+    instances: Vec<Instance>,
+    instance_buffer: wgpu::Buffer,
 }
 
 impl State {
@@ -209,7 +225,7 @@ impl State {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[Vertex::desc()],
+                buffers: &[Vertex::desc(), InstanceRaw::desc()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -252,6 +268,30 @@ impl State {
             usage: wgpu::BufferUsages::INDEX,
         });
 
+        let instances: Vec<Instance> =
+            iproduct!(0..NUM_INSTANCES_PER_ROW, 0..NUM_INSTANCES_PER_ROW)
+                .map(|(z, x)| {
+                    let position = glam::Vec3::new(x as f32, 0.0, z as f32);
+                    let rotation = if position == glam::Vec3::ZERO {
+                        glam::Quat::from_axis_angle(glam::Vec3::Z, 0.0)
+                    } else {
+                        glam::Quat::from_axis_angle(
+                            position.normalize(),
+                            std::f32::consts::FRAC_PI_4,
+                        )
+                    };
+
+                    Instance { position, rotation }
+                })
+                .collect();
+
+        let instance_data: Vec<InstanceRaw> = instances.iter().map(Instance::to_raw).collect();
+        let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Instance Buffer"),
+            contents: bytemuck::cast_slice(&instance_data),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
         Ok(Self {
             surface,
             device,
@@ -270,6 +310,8 @@ impl State {
             num_indices: INDICES.len() as u32,
             diffuse_bind_group,
             diffuse_texture,
+            instances,
+            instance_buffer,
         })
     }
 
@@ -336,8 +378,9 @@ impl State {
             render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
             render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+            render_pass.draw_indexed(0..self.num_indices, 0, 0..self.instances.len() as _);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
